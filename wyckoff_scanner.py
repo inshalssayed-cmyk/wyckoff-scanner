@@ -220,8 +220,25 @@ def scan_symbol(symbol):
     send_telegram_alert(message)
 
 
+def build_startup_message():
+    return (
+        "🟢 *Wyckoff Scanner — STARTED*\n\n"
+        "*Strategy:* Wyckoff Accumulation Detection\n"
+        "*Signals tracked:* Spring, Sign of Strength (SOS), Last Point of Support (LPS)\n"
+        "*Confirmation:* CVD (Cumulative Volume Delta) from live trade tape\n"
+        "*Data source:* KuCoin (OHLCV + trade history)\n\n"
+        f"*Watchlist:* {', '.join(WATCHLIST)}\n"
+        f"*Timeframe:* {KLINE_TYPE}\n"
+        f"*Scan interval:* every {SCAN_INTERVAL_SECONDS // 60} min\n\n"
+        "You'll get an alert here the moment a Spring, SOS, or LPS is detected "
+        "on any watchlist coin — confidence tagged HIGH or MEDIUM based on CVD confirmation.\n\n"
+        "_Note: this flags statistical setups, not guaranteed outcomes — always your own judgment on entries._"
+    )
+
+
 def run_scanner():
     print("Starting Wyckoff scanner... (Ctrl+C to stop)")
+    send_telegram_alert(build_startup_message())
     while True:
         for symbol in WATCHLIST:
             try:
