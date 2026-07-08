@@ -37,6 +37,7 @@ Install deps:
 import time
 import os
 import json
+import threading
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -104,6 +105,13 @@ KUCOIN_BASE = "https://api.kucoin.com"
 # --- In-memory state (resets on restart — fine for now, DB comes later) ---
 last_alert_time = {}     # symbol -> unix timestamp of last alert sent
 pending_outcomes = []    # list of dicts tracking alerts awaiting outcome checks
+scanner_stats = {        # live stats served by the /status Telegram command
+    "start_time": time.time(),
+    "last_cycle_time": None,
+    "symbols_count": 0,
+    "cycles_completed": 0,
+    "alerts_sent": 0,
+}
 
 
 # ============================================================
@@ -546,6 +554,242 @@ def send_telegram_alert(message):
 
 
 # ============================================================
+# TELEGRAM COMMANDS (/status, /positions, /results, /help)
+# Runs in a background thread so the scanner loop is never blocked.
+# ============================================================
+def _format_uptime(seconds):
+    h, rem = divmod(int(seconds), 3600)
+    m, _ = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+SCANNER_NAME = "Inshal Crypto Scanner"
+SCANNER_VERSION = "v3.0"
+
+
+def handle_status_command():
+    results_logged = 0
+    if os.path.exists(OUTCOME_LOG_PATH):
+        try:
+            with open(OUTCOME_LOG_PATH) as f:
+                results_logged = sum(1 for line in f if line.strip())
+        except Exception:
+            pass
+
+    open_positions = len([p for p in pending_outcomes if p["stage"] in ("open", "tp1_hit")])
+    waiting_fills = len([p for p in pending_outcomes if p["stage"] == "pending_entry"])
+
+    return (
+        f"🤖 *{SCANNER_NAME} {SCANNER_VERSION} Status*\n\n"
+        f"✅ Running: True\n"
+        f"🔄 Scans Completed: {scanner_stats['cycles_completed']}\n"
+        f"📈 Active Positions: {open_positions}\n"
+        f"⏳ Pending Limit Orders: {waiting_fills}\n"
+        f"👀 Coins in Watchlist: {scanner_stats['symbols_count']}\n"
+        f"📋 Total Results Logged: {results_logged}\n"
+        f"🎯 Threshold: Score ≥{MIN_ALERT_SCORE} | HIGH confidence ≥80\n"
+        f"🧱 Wall Entry Detection: ENABLED\n"
+        f"💰 TP1: min +{TP1_MIN_PCT:.0f}% | TP2: min +{TP2_MIN_PCT:.0f}% | SL: dynamic (ATR below wall)"
+    )
+
+
+def handle_positions_command():
+    active = [p for p in pending_outcomes if p["stage"] in ("open", "tp1_hit")]
+    waiting = [p for p in pending_outcomes if p["stage"] == "pending_entry"]
+
+    if not active and not waiting:
+        return "📭 No active positions right now."
+
+    lines = []
+    if active:
+        lines.append(f"📈 *Active Positions ({len(active)})*\n")
+        for p in active:
+            try:
+                price = get_current_price(p["symbol"])
+            except Exception:
+                price = None
+
+            if price:
+                move_pct = round((price - p["entry_price"]) / p["entry_price"] * 100, 2)
+                sign = "+" if move_pct >= 0 else ""
+                current_line = f"  Current: ${price:g} ({sign}{move_pct}%)\n"
+            else:
+                current_line = "  Current: (price unavailable)\n"
+
+            tp1_note = "  🎯 TP1 HIT — stop at breakeven\n" if p["stage"] == "tp1_hit" else ""
+
+            lines.append(
+                f"*{p['symbol']}*\n"
+                f"  Entry: ${p['entry_price']:g}\n"
+                f"{current_line}"
+                f"  TP1: ${p['take_profit_1']:g}\n"
+                f"  TP2: ${p['take_profit_2']:g}\n"
+                f"  SL: ${p['stop_loss']:g}\n"
+                f"{tp1_note}"
+            )
+
+    if waiting:
+        lines.append(f"⏳ *Pending Limit Orders ({len(waiting)})*\n")
+        for p in waiting:
+            lines.append(
+                f"*{p['symbol']}* — waiting for fill at ${p['entry_price']:g}\n"
+                f"  TP1: ${p['take_profit_1']:g} | TP2: ${p['take_profit_2']:g} | SL: ${p['stop_loss']:g}\n"
+            )
+
+    return "\n".join(lines)
+
+
+def handle_results_command():
+    if not os.path.exists(OUTCOME_LOG_PATH):
+        return "📭 No completed trades logged yet."
+
+    records = []
+    try:
+        with open(OUTCOME_LOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    except Exception as e:
+        return f"⚠️ Could not read results log: {e}"
+
+    if not records:
+        return "📭 No completed trades logged yet."
+
+    total = len(records)
+    tp2_hits = [r for r in records if r["outcome"] == "TP2_FULL_EXIT"]
+    tp1_hits = [r for r in records if r["outcome"] == "BREAKEVEN_EXIT"]  # TP1 was reached, rest exited flat
+    stopped = [r for r in records if r["outcome"] == "STOPPED"]
+    expired = [r for r in records if r["outcome"] == "ENTRY_EXPIRED"]
+    timeouts = [r for r in records if r["outcome"] == "TIMEOUT_CLOSE"]
+
+    def pct(n):
+        return round(n / total * 100, 1) if total else 0.0
+
+    closed = [r for r in records if r["outcome"] != "ENTRY_EXPIRED"]
+    wins = [r for r in closed if r["realized_pct"] > 0]
+    losses = [r for r in closed if r["realized_pct"] < 0]
+    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
+    avg_win = round(sum(r["realized_pct"] for r in wins) / len(wins), 2) if wins else 0.0
+    avg_loss = round(sum(r["realized_pct"] for r in losses) / len(losses), 2) if losses else 0.0
+
+    bar = "━" * 20
+
+    # --- By entry type (Wall vs Structure anchored entries) ---
+    anchor_stats = {}
+    for r in closed:
+        a = r.get("anchor", "unknown").capitalize()
+        stats = anchor_stats.setdefault(a, {"wins": 0, "total": 0})
+        stats["total"] += 1
+        if r["realized_pct"] > 0:
+            stats["wins"] += 1
+    anchor_lines = "\n".join(
+        f"• {a}: {s['wins']}/{s['total']} win "
+        f"({round(s['wins'] / s['total'] * 100, 0):.0f}%)"
+        for a, s in sorted(anchor_stats.items())
+    ) or "• (no closed trades yet)"
+
+    # --- Trade log (last 10, newest first) ---
+    outcome_short = {
+        "TP2_FULL_EXIT": "TP2",
+        "BREAKEVEN_EXIT": "TP1",
+        "STOPPED": "SL",
+        "ENTRY_EXPIRED": "EXPIRED",
+        "TIMEOUT_CLOSE": "TIMEOUT",
+    }
+    log_lines = "\n".join(
+        f"  {r['symbol']} → {outcome_short.get(r['outcome'], r['outcome'])}  "
+        f"{'+' if r['realized_pct'] >= 0 else ''}{r['realized_pct']:.2f}%  "
+        f"[{r.get('anchor', 'unknown').capitalize()}]"
+        for r in reversed(records[-10:])
+    )
+
+    timeout_line = f"⏱ Timeout:     {len(timeouts)}  ({pct(len(timeouts))}%)\n" if timeouts else ""
+
+    return (
+        f"📊 *Scanner Performance Report*\n"
+        f"🗓 All time | {total} trade(s)\n"
+        f"{bar}\n"
+        f"🏆 TP2 Hit:      {len(tp2_hits)}  ({pct(len(tp2_hits))}%)\n"
+        f"🎯 TP1 Hit:      {len(tp1_hits)}  ({pct(len(tp1_hits))}%)\n"
+        f"🛑 Stop Loss:    {len(stopped)}  ({pct(len(stopped))}%)\n"
+        f"⌛ Expired:      {len(expired)}  ({pct(len(expired))}%)\n"
+        f"{timeout_line}"
+        f"{bar}\n"
+        f"✅ Win Rate:   {win_rate}%\n"
+        f"📈 Avg Win:    +{avg_win}%\n"
+        f"📉 Avg Loss:   {avg_loss}%\n"
+        f"{bar}\n"
+        f"*BY ENTRY TYPE:*\n"
+        f"{anchor_lines}\n"
+        f"{bar}\n"
+        f"*TRADE LOG:*\n"
+        f"{log_lines}"
+    )
+
+
+def handle_help_command():
+    return (
+        "🤖 *Commands*\n\n"
+        "/status — scanner health, uptime, cycles, open position count\n"
+        "/positions — every tracked trade and pending limit order, live\n"
+        "/results — win rate and outcome summary from the trade log\n"
+        "/help — this message"
+    )
+
+
+COMMAND_HANDLERS = {
+    "/status": handle_status_command,
+    "/positions": handle_positions_command,
+    "/position": handle_positions_command,   # alias — both spellings work
+    "/results": handle_results_command,
+    "/result": handle_results_command,       # alias
+    "/help": handle_help_command,
+    "/start": handle_help_command,           # Telegram convention
+}
+
+
+def poll_telegram_commands():
+    """
+    Long-polls Telegram's getUpdates in a background thread and answers
+    recognized commands. Only responds to messages from the configured
+    TELEGRAM_CHAT_ID — anyone else messaging the bot is ignored.
+    """
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset = None
+
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset is not None:
+                params["offset"] = offset
+            r = requests.get(url, params=params, timeout=40)
+            updates = r.json().get("result", [])
+
+            for update in updates:
+                offset = update["update_id"] + 1
+                msg = update.get("message") or {}
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+                text = (msg.get("text") or "").strip()
+
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue  # ignore anyone who isn't you
+
+                command = text.split()[0].split("@")[0].lower() if text else ""
+                handler = COMMAND_HANDLERS.get(command)
+                if handler:
+                    try:
+                        send_telegram_alert(handler())
+                    except Exception as e:
+                        send_telegram_alert(f"⚠️ Command failed: {e}")
+        except Exception as e:
+            print(f"[Telegram polling error] {e}")
+            time.sleep(5)  # back off briefly, then resume listening
+
+
+# ============================================================
 # OUTCOME TRACKER
 # ============================================================
 def log_signal_for_outcome_tracking(symbol, score, levels, ts):
@@ -559,6 +803,7 @@ def log_signal_for_outcome_tracking(symbol, score, levels, ts):
         "stop_loss": levels["stop_loss"],
         "take_profit_1": levels["take_profit_1"],
         "take_profit_2": levels["take_profit_2"],
+        "anchor": levels["anchor"],   # "wall" or "structure" — used in /results breakdown
         "score": score,
         "alert_time": time.time(),
         "alert_time_str": ts,
@@ -572,6 +817,7 @@ def _log_outcome_record(entry, outcome_label, exit_price, realized_pct):
     record = {
         "symbol": entry["symbol"],
         "score": entry["score"],
+        "anchor": entry.get("anchor", "unknown"),
         "alert_time": entry["alert_time_str"],
         "entry_price": entry["entry_price"],
         "outcome": outcome_label,
@@ -779,6 +1025,7 @@ def scan_symbol(symbol):
     )
     print(message)
     send_telegram_alert(message)
+    scanner_stats["alerts_sent"] += 1
 
     last_alert_time[symbol] = time.time()
     log_signal_for_outcome_tracking(symbol, score, levels, ts)
@@ -806,6 +1053,7 @@ def build_startup_message(symbol_count):
         f"Plan: TP1 closes {PARTIAL_CLOSE_PCT}% and moves stop to breakeven, "
         f"TP2 closes the rest. Fills, expiries, and outcomes are tracked "
         f"automatically and logged to {OUTCOME_LOG_PATH} for review.\n\n"
+        f"*Commands:* /status /positions /results /help\n\n"
         "_Note: this flags statistical setups, not guaranteed outcomes — always your own judgment on entries._"
     )
 
@@ -813,12 +1061,18 @@ def build_startup_message(symbol_count):
 def run_scanner():
     print("Starting Wyckoff scalping scanner... (Ctrl+C to stop)")
 
+    # Start the Telegram command listener in the background
+    command_thread = threading.Thread(target=poll_telegram_commands, daemon=True)
+    command_thread.start()
+    print("[Info] Telegram command listener started (/status, /positions, /results, /help)")
+
     symbols_cache = []
     last_symbol_refresh = 0
 
     try:
         symbols_cache = get_all_kucoin_symbols()
         last_symbol_refresh = time.time()
+        scanner_stats["symbols_count"] = len(symbols_cache)
         print(f"[Info] Loaded {len(symbols_cache)} symbols to scan")
     except Exception as e:
         print(f"[Error loading initial symbol list] {e}")
@@ -831,6 +1085,7 @@ def run_scanner():
             try:
                 symbols_cache = get_all_kucoin_symbols()
                 last_symbol_refresh = now
+                scanner_stats["symbols_count"] = len(symbols_cache)
                 print(f"[Info] Refreshed symbol list — {len(symbols_cache)} pairs to scan")
             except Exception as e:
                 print(f"[Error refreshing symbol list] {e}")
@@ -843,6 +1098,8 @@ def run_scanner():
             time.sleep(0.3)  # be polite to the API between symbols
 
         check_pending_outcomes()
+        scanner_stats["last_cycle_time"] = time.time()
+        scanner_stats["cycles_completed"] += 1
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
