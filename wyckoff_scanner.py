@@ -4,9 +4,16 @@ Wyckoff Scalping Scanner — v3
 Scans ALL liquid KuCoin USDT pairs (dynamic watchlist) for Wyckoff
 accumulation signals on a 5-min chart, using 48 hours of context to judge
 where price sits in the broader range. Scores each setup 0-100 and only
-alerts on the strongest ones, with entry/stop/target levels, a per-symbol
-cooldown, spread/liquidity filtering, better CVD windowing, and a simple
-outcome tracker — all layered on top of the original scanner.
+alerts on the strongest ones.
+
+Entries are anchored to REAL order-book liquidity: the scanner reads the
+top 100 levels of resting bids and places the entry just above the largest
+genuine buy wall below price (falling back to accumulation-range support
+when no wall stands out). Stops sit just below the wall (wall breaks =
+trade reason gone), targets enforce 3%/5% scalping floors and 1:2 / 1:3
+minimum risk:reward. Includes per-symbol cooldown, spread filtering,
+windowed CVD, and a full trade-plan outcome tracker (fill -> TP1 partial
+-> breakeven / TP2 / stop / expiry).
 
 No on-chain / Nansen dependency yet — that's a separate future layer.
 
@@ -68,8 +75,18 @@ CVD_MAX_PAGES = 5                          # safety cap on trade-history paginat
 # --- Spread / liquidity settings ---
 MAX_SPREAD_PCT = 0.15              # skip alert if bid/ask spread exceeds this % — too costly to scalp
 
-# --- Trade level settings ---
-MIN_RISK_REWARD = 1.5              # minimum reward multiple of risk used when projecting target
+# --- Trade level settings (order-book wall-anchored entry) ---
+ATR_PERIOD = 14                    # ATR lookback for volatility-sized stops
+ATR_STOP_MULTIPLE = 1.0            # extra buffer below the wall for the stop
+WALL_SCAN_DEPTH_PCT = 2.0          # scan bids up to this % below current price for walls
+WALL_MIN_MULTIPLE = 3.0            # a "wall" = bid level at least 3x the average bid size in the scan zone
+ENTRY_ABOVE_WALL_PCT = 0.05        # entry placed 0.05% above the wall (fill just before others defending it)
+TP1_MIN_PCT = 3.0                  # scalping floor — TP1 must offer at least this much room
+TP2_MIN_PCT = 5.0                  # scalping floor — TP2 must offer at least this much room
+MIN_RISK_REWARD_TP1 = 2.0          # TP1 must be at least 1:2 vs risk
+MIN_RISK_REWARD_TP2 = 3.0          # TP2 must be at least 1:3 vs risk
+PARTIAL_CLOSE_PCT = 50             # % of the position closed when TP1 hits
+ENTRY_EXPIRY_HOURS = 6             # cancel an unfilled limit entry if price never comes back to it
 
 # --- Cooldown settings ---
 COOLDOWN_SECONDS = 1800            # 30 min — don't re-alert the same symbol before this passes
@@ -80,7 +97,7 @@ SCAN_INTERVAL_SECONDS = 300        # how often to re-scan (5 min, matches candle
 
 # --- Outcome tracker settings ---
 OUTCOME_LOG_PATH = "outcome_log.jsonl"
-OUTCOME_CHECK_MINUTES = [15, 30, 60]   # check price this many minutes after each alert
+OUTCOME_TIMEOUT_HOURS = 4           # force-close a filled trade if nothing resolves within this long
 
 KUCOIN_BASE = "https://api.kucoin.com"
 
@@ -190,6 +207,65 @@ def get_orderbook_snapshot(symbol):
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     r.raise_for_status()
     return r.json().get("data") or {}
+
+
+def get_orderbook_depth(symbol):
+    """
+    Fetch the top 100 levels of real order book depth (public endpoint).
+    Returns {'bids': [[price, size], ...], 'asks': [[price, size], ...]}.
+    """
+    url = f"{KUCOIN_BASE}/api/v1/market/orderbook/level2_100"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    return r.json().get("data") or {}
+
+
+def find_bid_wall(symbol, current_price, scan_depth_pct=WALL_SCAN_DEPTH_PCT,
+                  min_multiple=WALL_MIN_MULTIPLE):
+    """
+    Scans real resting bids below current price for a genuine buy wall:
+    a level (or tight cluster) holding at least `min_multiple`x the average
+    bid size within the scan zone. Walls act as actual defended floors —
+    real money sitting there, not a line drawn on a chart.
+
+    Returns {'price': ..., 'size': ..., 'strength': ...} or None if the
+    book has no meaningful wall right now (in which case the caller falls
+    back to structure-based levels).
+    """
+    try:
+        book = get_orderbook_depth(symbol)
+    except Exception:
+        return None
+
+    bids = book.get("bids") or []
+    if not bids:
+        return None
+
+    floor_price = current_price * (1 - scan_depth_pct / 100)
+    zone = []
+    for level in bids:
+        try:
+            p = float(level[0])
+            s = float(level[1])
+        except (ValueError, IndexError, TypeError):
+            continue
+        if floor_price <= p < current_price:
+            zone.append((p, p * s))  # size in quote (USDT) terms so coins compare fairly
+
+    if len(zone) < 5:
+        return None  # too thin a book to call anything a wall
+
+    avg_value = sum(v for _, v in zone) / len(zone)
+    best_price, best_value = max(zone, key=lambda x: x[1])
+
+    if avg_value <= 0 or best_value < avg_value * min_multiple:
+        return None  # nothing stands out enough to be a real wall
+
+    return {
+        "price": best_price,
+        "value_usdt": round(best_value, 2),
+        "strength": round(best_value / avg_value, 2),  # how many times the average this wall is
+    }
 
 
 def get_spread_pct(symbol):
@@ -324,42 +400,102 @@ def compute_cvd(trades):
 # ============================================================
 # TRADE LEVELS (entry / stop / target)
 # ============================================================
-def compute_trade_levels(df, accum_info):
+def compute_atr(df, period=ATR_PERIOD):
+    """Wilder's Average True Range — standard volatility measure for stop sizing."""
+    high = df["high"]
+    low = df["low"]
+    prev_close = df["close"].shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr.iloc[-1]
+
+
+def compute_trade_levels(df, accum_info, symbol):
     """
-    Builds a simple entry/stop/target plan off the same range data the
-    scanner already computed — no separate indicator needed.
-    - Entry: current close
-    - Stop: just below the recent tight range (or short-term range) low
-    - Target: the recent range high, or a 1.5R projection if the range
-      itself is too thin to offer a decent reward
+    Anchors the entry to REAL order book liquidity instead of a price
+    calculated from a formula:
+
+    - Entry: scans actual resting bids below current price for a genuine
+      buy wall (a level holding several times the average bid size).
+      Entry is placed just above that wall — real money is defending
+      that price, so fills there sit on top of an actual floor.
+      If no meaningful wall exists right now, falls back to the
+      accumulation range support (structure-based).
+    - Stop: just below the wall minus an ATR buffer — if the wall breaks,
+      the reason for the trade is gone, so the exit is immediate and small.
+    - TP1 / TP2: 3% / 5% scalping floors, raised further if needed so
+      TP1 is never worse than 1:2 risk:reward and TP2 never worse than 1:3.
     """
-    last = df.iloc[-1]
-    entry = float(last["close"])
+    last_close = float(df["close"].iloc[-1])
+    atr = compute_atr(df)
+    if pd.isna(atr) or atr <= 0:
+        atr = last_close * 0.005  # fallback before enough candles exist for a real ATR
 
     if accum_info:
-        local_low = accum_info["range_low"]
-        local_high = accum_info["range_high"]
+        range_low = accum_info["range_low"]
     else:
-        local_low = df["range_low"].iloc[-1]
-        local_high = df["range_high"].iloc[-1]
+        range_low = df["range_low"].iloc[-1]
 
-    stop_loss = local_low * 0.995  # small buffer below support
+    # --- Entry: anchored to a real bid wall when one exists ---
+    wall = find_bid_wall(symbol, last_close)
+    if wall:
+        entry = wall["price"] * (1 + ENTRY_ABOVE_WALL_PCT / 100)
+        anchor = "wall"
+        wall_info = wall
+        stop_base = wall["price"]
+    else:
+        entry = range_low  # structure fallback: buy at accumulation support
+        anchor = "structure"
+        wall_info = None
+        stop_base = range_low
+
+    entry = min(entry, last_close)  # never place a "buy" above where price already trades
+    is_pullback_order = entry < last_close * 0.999
+
+    # --- Stop: below the anchor with an ATR buffer ---
+    stop_loss = stop_base - atr * ATR_STOP_MULTIPLE
     risk = entry - stop_loss
-
     if risk <= 0:
-        # fallback if data is weird (e.g. entry already below "support")
-        risk = entry * 0.005
+        risk = atr * ATR_STOP_MULTIPLE
         stop_loss = entry - risk
 
-    take_profit = max(local_high, entry + risk * MIN_RISK_REWARD)
-    reward = take_profit - entry
-    rr_ratio = round(reward / risk, 2) if risk > 0 else None
+    # --- Targets: scalping % floors, raised by R:R floors where needed ---
+    take_profit_1 = max(
+        entry * (1 + TP1_MIN_PCT / 100),
+        entry + risk * MIN_RISK_REWARD_TP1,
+    )
+    take_profit_2 = max(
+        entry * (1 + TP2_MIN_PCT / 100),
+        entry + risk * MIN_RISK_REWARD_TP2,
+        take_profit_1 + risk,
+    )
+
+    sl_pct = round((entry - stop_loss) / entry * 100, 2)
+    tp1_pct = round((take_profit_1 - entry) / entry * 100, 2)
+    tp2_pct = round((take_profit_2 - entry) / entry * 100, 2)
+
+    rr1 = round((take_profit_1 - entry) / risk, 2) if risk > 0 else None
+    rr2 = round((take_profit_2 - entry) / risk, 2) if risk > 0 else None
 
     return {
         "entry": round(entry, 6),
+        "anchor": anchor,                     # "wall" or "structure"
+        "wall": wall_info,                    # None if no wall found
+        "is_pullback_order": is_pullback_order,
+        "last_market_price": round(last_close, 6),
+        "atr": round(atr, 6),
         "stop_loss": round(stop_loss, 6),
-        "take_profit": round(take_profit, 6),
-        "rr_ratio": rr_ratio,
+        "sl_pct": sl_pct,
+        "take_profit_1": round(take_profit_1, 6),
+        "tp1_pct": tp1_pct,
+        "rr1": rr1,
+        "take_profit_2": round(take_profit_2, 6),
+        "tp2_pct": tp2_pct,
+        "rr2": rr2,
     }
 
 
@@ -413,56 +549,125 @@ def send_telegram_alert(message):
 # OUTCOME TRACKER
 # ============================================================
 def log_signal_for_outcome_tracking(symbol, score, levels, ts):
+    # If the entry is a pullback limit order, it hasn't filled yet — start
+    # in pending_entry and only begin trade management once price actually
+    # reaches the entry. If entry is at/near market, treat it as filled now.
+    initial_stage = "pending_entry" if levels["is_pullback_order"] else "open"
     pending_outcomes.append({
         "symbol": symbol,
         "entry_price": levels["entry"],
+        "stop_loss": levels["stop_loss"],
+        "take_profit_1": levels["take_profit_1"],
+        "take_profit_2": levels["take_profit_2"],
         "score": score,
         "alert_time": time.time(),
         "alert_time_str": ts,
-        "checked_minutes": [],
+        "stage": initial_stage,   # pending_entry -> open -> tp1_hit -> closed
+        "fill_time": None if initial_stage == "pending_entry" else time.time(),
+        "realized_pct": 0.0,      # weighted % already locked in from any partial close
     })
+
+
+def _log_outcome_record(entry, outcome_label, exit_price, realized_pct):
+    record = {
+        "symbol": entry["symbol"],
+        "score": entry["score"],
+        "alert_time": entry["alert_time_str"],
+        "entry_price": entry["entry_price"],
+        "outcome": outcome_label,
+        "exit_price": round(exit_price, 6),
+        "realized_pct": round(realized_pct, 3),
+    }
+    with open(OUTCOME_LOG_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"[Outcome] {entry['symbol']} {outcome_label}: {round(realized_pct, 3)}%")
 
 
 def check_pending_outcomes():
     """
-    Revisits each logged alert at 15/30/60 min marks, records the price move
-    at that point, and appends the result to a local JSONL file so signal
-    quality can be reviewed later instead of guessed at.
+    Walks each alert through the actual trade plan:
+      pending_entry -> price touches entry     => FILLED, becomes open
+      pending_entry -> ENTRY_EXPIRY_HOURS pass => ENTRY_EXPIRED, no trade
+      open          -> price hits stop_loss    => STOPPED, fully closed
+      open          -> price hits TP1          => close 50%, stop to breakeven
+      tp1_hit       -> price hits TP2          => close remaining, TP2_FULL_EXIT
+      tp1_hit       -> price returns to entry  => close remaining, BREAKEVEN_EXIT
+      (filled)      -> OUTCOME_TIMEOUT_HOURS pass with no resolution
+                       => close at current price, TIMEOUT_CLOSE
+    Every resolution is appended to outcome_log.jsonl for later review.
     """
     if not pending_outcomes:
         return
 
     now = time.time()
     still_pending = []
+
     for entry in pending_outcomes:
-        elapsed_minutes = (now - entry["alert_time"]) / 60
-        due = [m for m in OUTCOME_CHECK_MINUTES
-               if elapsed_minutes >= m and m not in entry["checked_minutes"]]
+        entry_price = entry["entry_price"]
 
-        for m in due:
-            try:
-                current_price = get_current_price(entry["symbol"])
-                if current_price:
-                    pct_move = round(
-                        (current_price - entry["entry_price"]) / entry["entry_price"] * 100, 3
-                    )
-                    record = {
-                        "symbol": entry["symbol"],
-                        "score": entry["score"],
-                        "alert_time": entry["alert_time_str"],
-                        "entry_price": entry["entry_price"],
-                        "check_minutes": m,
-                        "price_at_check": current_price,
-                        "pct_move": pct_move,
-                    }
-                    with open(OUTCOME_LOG_PATH, "a") as f:
-                        f.write(json.dumps(record) + "\n")
-                    print(f"[Outcome] {entry['symbol']} +{m}min: {pct_move}%")
-            except Exception as e:
-                print(f"[Error checking outcome for {entry['symbol']}] {e}")
-            entry["checked_minutes"].append(m)
+        try:
+            price = get_current_price(entry["symbol"])
+        except Exception as e:
+            print(f"[Error checking outcome for {entry['symbol']}] {e}")
+            still_pending.append(entry)
+            continue
 
-        if len(entry["checked_minutes"]) < len(OUTCOME_CHECK_MINUTES):
+        if not price:
+            still_pending.append(entry)
+            continue
+
+        resolved = False
+
+        # --- Stage 0: limit order waiting to fill ---
+        if entry["stage"] == "pending_entry":
+            hours_waiting = (now - entry["alert_time"]) / 3600
+            if price <= entry_price:
+                entry["stage"] = "open"
+                entry["fill_time"] = now
+                print(f"[Outcome] {entry['symbol']} entry FILLED at {entry_price} "
+                      f"(price touched the wall zone)")
+            elif hours_waiting >= ENTRY_EXPIRY_HOURS:
+                _log_outcome_record(entry, "ENTRY_EXPIRED", price, 0.0)
+                resolved = True
+            if not resolved:
+                still_pending.append(entry)
+            continue
+
+        elapsed_hours = (now - (entry["fill_time"] or entry["alert_time"])) / 3600
+
+        if entry["stage"] == "open":
+            if price <= entry["stop_loss"]:
+                pct = (price - entry_price) / entry_price * 100
+                _log_outcome_record(entry, "STOPPED", price, pct)
+                resolved = True
+            elif price >= entry["take_profit_1"]:
+                tp1_pct = (entry["take_profit_1"] - entry_price) / entry_price * 100
+                entry["realized_pct"] = tp1_pct * (PARTIAL_CLOSE_PCT / 100)
+                entry["stage"] = "tp1_hit"
+                print(f"[Outcome] {entry['symbol']} TP1 hit — {PARTIAL_CLOSE_PCT}% closed at "
+                      f"+{round(tp1_pct, 3)}%, stop moved to breakeven for the remainder")
+
+        elif entry["stage"] == "tp1_hit":
+            if price >= entry["take_profit_2"]:
+                tp2_pct = (entry["take_profit_2"] - entry_price) / entry_price * 100
+                total_pct = entry["realized_pct"] + tp2_pct * (PARTIAL_CLOSE_PCT / 100)
+                _log_outcome_record(entry, "TP2_FULL_EXIT", price, total_pct)
+                resolved = True
+            elif price <= entry_price:
+                total_pct = entry["realized_pct"]  # remaining 50% exits flat at breakeven
+                _log_outcome_record(entry, "BREAKEVEN_EXIT", price, total_pct)
+                resolved = True
+
+        if not resolved and elapsed_hours >= OUTCOME_TIMEOUT_HOURS:
+            current_pct = (price - entry_price) / entry_price * 100
+            if entry["stage"] == "tp1_hit":
+                total_pct = entry["realized_pct"] + current_pct * (PARTIAL_CLOSE_PCT / 100)
+            else:
+                total_pct = current_pct
+            _log_outcome_record(entry, "TIMEOUT_CLOSE", price, total_pct)
+            resolved = True
+
+        if not resolved:
             still_pending.append(entry)
 
     pending_outcomes[:] = still_pending
@@ -509,7 +714,7 @@ def scan_symbol(symbol):
         print(f"[Skip] {symbol} score {score} but spread {spread_pct}% > {MAX_SPREAD_PCT}% max")
         return
 
-    levels = compute_trade_levels(df, accum_info)
+    levels = compute_trade_levels(df, accum_info, symbol)
 
     confirmations = []
     if cvd is not None and cvd > 0:
@@ -534,15 +739,40 @@ def scan_symbol(symbol):
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+    if levels["anchor"] == "wall":
+        wall = levels["wall"]
+        entry_line = (
+            f"Entry: {levels['entry']} — LIMIT order anchored just above a real "
+            f"buy wall at {wall['price']} (${wall['value_usdt']:,.0f} resting, "
+            f"{wall['strength']}x average bid size)\n"
+        )
+    else:
+        entry_line = (
+            f"Entry: {levels['entry']} — LIMIT order at accumulation support "
+            f"(no dominant order-book wall right now)\n"
+        )
+
+    fill_note = (
+        "Order type: pullback limit — wait for price to come DOWN to entry, do not chase\n"
+        if levels["is_pullback_order"]
+        else "Order type: at/near market — price is already at the entry zone\n"
+    )
+
     message = (
         f"*Wyckoff Signal — {symbol}*\n"
         f"Score: {score}/100\n"
         f"Type: {', '.join(signal_type)}\n"
         f"Confidence: {confidence}\n\n"
-        f"Entry: {levels['entry']}\n"
-        f"Stop Loss: {levels['stop_loss']}\n"
-        f"Take Profit: {levels['take_profit']}\n"
-        f"Risk:Reward: 1:{levels['rr_ratio']}\n\n"
+        f"{entry_line}"
+        f"{fill_note}"
+        f"Current market price: {levels['last_market_price']}\n"
+        f"Stop Loss: {levels['stop_loss']} (-{levels['sl_pct']}%)\n"
+        f"TP1: {levels['take_profit_1']} (+{levels['tp1_pct']}%, R:R 1:{levels['rr1']})\n"
+        f"TP2: {levels['take_profit_2']} (+{levels['tp2_pct']}%, R:R 1:{levels['rr2']})\n\n"
+        f"*Plan:* at TP1 close {PARTIAL_CLOSE_PCT}% and move stop to breakeven "
+        f"(entry). If price falls back to entry after that, exit the rest at "
+        f"breakeven. If TP2 hits, close the remaining {100 - PARTIAL_CLOSE_PCT}% fully. "
+        f"If entry doesn't fill within {ENTRY_EXPIRY_HOURS}h, cancel the order.\n\n"
         f"48h Range: {macro['macro_low']} - {macro['macro_high']} (currently at {macro['position_pct']}%)\n"
         f"Confirmations: {', '.join(confirmations) if confirmations else 'none (price/volume only)'}\n"
         f"Time: {ts}"
@@ -569,8 +799,13 @@ def build_startup_message(symbol_count):
         f"*Min alert score:* {MIN_ALERT_SCORE}/100\n"
         f"*Cooldown:* {COOLDOWN_SECONDS // 60} min per symbol\n"
         f"*Max spread:* {MAX_SPREAD_PCT}%\n\n"
-        "Each alert now includes entry/stop/target levels, and outcomes get "
-        "logged automatically at 15/30/60 min for later review.\n\n"
+        f"Entries are anchored to REAL order-book buy walls (live resting bids), "
+        f"falling back to accumulation support when no wall exists — always a limit "
+        f"order, never a market chase. Each alert includes stop and two targets "
+        f"with % distances (TP1 min {TP1_MIN_PCT}%, TP2 min {TP2_MIN_PCT}%). "
+        f"Plan: TP1 closes {PARTIAL_CLOSE_PCT}% and moves stop to breakeven, "
+        f"TP2 closes the rest. Fills, expiries, and outcomes are tracked "
+        f"automatically and logged to {OUTCOME_LOG_PATH} for review.\n\n"
         "_Note: this flags statistical setups, not guaranteed outcomes — always your own judgment on entries._"
     )
 
