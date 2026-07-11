@@ -1,37 +1,32 @@
 """
-Wyckoff Scalping Scanner — v3
-==============================
+Wyckoff Scalping Scanner — v3 (market-entry, 1:1.5 R:R)
+======================================================
 Scans ALL liquid KuCoin USDT pairs (dynamic watchlist) for Wyckoff
 accumulation signals on a 5-min chart, using 48 hours of context to judge
-where price sits in the broader range. Scores each setup 0-100 and only
-alerts on the strongest ones.
+where price sits in the broader range. Scores each setup 0-100 and alerts
+on the strongest ones.
 
-Entries are anchored to REAL order-book liquidity: the scanner reads the
-top 100 levels of resting bids and places the entry just above the largest
-genuine buy wall below price (falling back to accumulation-range support
-when no wall stands out). Stops sit just below the wall (wall breaks =
-trade reason gone), targets enforce 3%/5% scalping floors and 1:2 / 1:3
-minimum risk:reward. Includes per-symbol cooldown, spread filtering,
-windowed CVD, and a full trade-plan outcome tracker (fill -> TP1 partial
--> breakeven / TP2 / stop / expiry).
+CHANGED IN THIS VERSION (based on live outcome data from 115 trades):
+  - ENTRY is now at MARKET price (instant fill). The previous wall-anchored
+    limit entry left ~50% of signals unfilled (expired) — market entry gets
+    us into every qualifying trade so the data is complete.
+  - Risk:Reward is 1:1.5. Default stop is a fixed 1% and target 1.5%.
+    (A structural, price-action stop is available via STOP_MODE below.)
+  - Single target, full exit — no more TP1/TP2 partial-close machinery,
+    since a 1.5% move has no room to split.
+  - Every trade now records MFE / MAE (max favourable / adverse excursion):
+    how far price actually ran up and down before the trade resolved. This
+    is the measurement that tells you whether 1.5% is well-calibrated.
 
-No on-chain / Nansen dependency yet — that's a separate future layer.
+Order-book wall detection is retained as an optional FILTER / confirmation
+(see REQUIRE_WALL) and as a reference for the structural stop.
 
-SETUP REQUIRED (set these as environment variables, not hardcoded):
-  - TELEGRAM_BOT_TOKEN : create a bot via @BotFather on Telegram
-  - TELEGRAM_CHAT_ID   : your chat/channel ID (message @userinfobot to get yours)
+ENV VARS (set on Render, not hardcoded):
+  - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  - DATABASE_URL (optional — enables the dashboard; Telegram-only without it)
 
-  Locally (before running):
-    export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
-    export TELEGRAM_CHAT_ID="your_chat_id"
-    python3 wyckoff_scanner.py
-
-  On Render: add these under your service's "Environment" tab instead.
-  Start command: python3 -u wyckoff_scanner.py (the -u flag avoids Render
-  swallowing print() output due to buffering).
-
-Install deps:
-  pip install requests pandas --break-system-packages
+Start command on Render:  python3 -u wyckoff_scanner.py
+Install deps:  pip install requests pandas psycopg2-binary --break-system-packages
 """
 
 import time
@@ -42,8 +37,16 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
+# Optional Postgres layer — scanner runs fine without it (Telegram + JSONL only).
+try:
+    import db
+    DB_ENABLED = db.is_available()
+except Exception:
+    db = None
+    DB_ENABLED = False
+
 # ============================================================
-# CONFIG — reads secrets from environment variables.
+# CONFIG
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -52,60 +55,71 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     print("[WARNING] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set — "
           "alerts will fail to send until these are configured.")
 
-# --- Dynamic watchlist settings ---
-MIN_VOLUME_USDT = 2_000_000       # 24h volume filter — keeps the symbol list to liquid pairs only
-SYMBOL_REFRESH_SECONDS = 3600      # refresh the tradable symbol list every hour
+SCANNER_NAME = "Inshal Crypto Scanner"
+SCANNER_VERSION = "v3.0"
 
-# --- Timeframe / context settings ---
-KLINE_TYPE = "5min"                # scalping-speed candles
-CANDLES_PER_HOUR = 12              # 5min candles = 12 per hour
+# --- Dynamic watchlist ---
+MIN_VOLUME_USDT = 2_000_000
+SYMBOL_REFRESH_SECONDS = 3600
+
+# --- Timeframe / context ---
+KLINE_TYPE = "5min"
+CANDLES_PER_HOUR = 12
 CONTEXT_HOURS = 48
-CONTEXT_CANDLES = CONTEXT_HOURS * CANDLES_PER_HOUR   # 576 candles = 48h of 5min data
+CONTEXT_CANDLES = CONTEXT_HOURS * CANDLES_PER_HOUR
 
-# --- Range / accumulation detection settings ---
-RANGE_WINDOW = 20                  # candles used to define the short-term trading range
-VOL_AVG_WINDOW = 20                # rolling window for average volume
-TIGHT_RANGE_PCT = 0.012            # 1.2% — how tight a "sideways" range must be
-ACCUM_LOOKBACK = 10                # candles checked for the tight-range accumulation window
-MACRO_POSITION_MAX_PCT = 55        # only treat as accumulation if in lower 55% of 48h range
+# --- Range / accumulation detection ---
+RANGE_WINDOW = 20
+VOL_AVG_WINDOW = 20
+TIGHT_RANGE_PCT = 0.012
+ACCUM_LOOKBACK = 10
+MACRO_POSITION_MAX_PCT = 55
 
-# --- CVD windowing settings ---
-CVD_WINDOW_MINUTES = ACCUM_LOOKBACK * 5   # match the CVD window to the accumulation lookback (50 min)
-CVD_MAX_PAGES = 5                          # safety cap on trade-history pagination per symbol
+# --- CVD windowing ---
+CVD_WINDOW_MINUTES = ACCUM_LOOKBACK * 5
+CVD_MAX_PAGES = 5
 
-# --- Spread / liquidity settings ---
-MAX_SPREAD_PCT = 0.15              # skip alert if bid/ask spread exceeds this % — too costly to scalp
+# --- Spread / liquidity ---
+MAX_SPREAD_PCT = 0.15
 
-# --- Trade level settings (order-book wall-anchored entry) ---
-ATR_PERIOD = 14                    # ATR lookback for volatility-sized stops
-ATR_STOP_MULTIPLE = 1.0            # extra buffer below the wall for the stop
-WALL_SCAN_DEPTH_PCT = 2.0          # scan bids up to this % below current price for walls
-WALL_MIN_MULTIPLE = 3.0            # a "wall" = bid level at least 3x the average bid size in the scan zone
-ENTRY_ABOVE_WALL_PCT = 0.05        # entry placed 0.05% above the wall (fill just before others defending it)
-TP1_MIN_PCT = 3.0                  # scalping floor — TP1 must offer at least this much room
-TP2_MIN_PCT = 5.0                  # scalping floor — TP2 must offer at least this much room
-MIN_RISK_REWARD_TP1 = 2.0          # TP1 must be at least 1:2 vs risk
-MIN_RISK_REWARD_TP2 = 3.0          # TP2 must be at least 1:3 vs risk
-PARTIAL_CLOSE_PCT = 50             # % of the position closed when TP1 hits
-ENTRY_EXPIRY_HOURS = 6             # cancel an unfilled limit entry if price never comes back to it
+# --- ENTRY / STOP / TARGET (the core of this version) ---
+ENTRY_MODE = "market"          # enter at current price — always fills
+RR_RATIO = 1.5                 # target distance = RR_RATIO x stop distance (1:1.5)
 
-# --- Cooldown settings ---
-COOLDOWN_SECONDS = 1800            # 30 min — don't re-alert the same symbol before this passes
+# Stop mode: "fixed" honours exactly what you described (1% stop -> 1.5% target).
+#            "structural" instead places the stop below the recent swing low /
+#            wall / range support (ATR-buffered) and clamps it to a sane band,
+#            so the stop respects price action; target stays RR_RATIO x risk.
+STOP_MODE = "fixed"            # "fixed" or "structural"
+FIXED_SL_PCT = 1.0             # used when STOP_MODE == "fixed"
 
-# --- Scoring / alerting settings ---
-MIN_ALERT_SCORE = 60               # only alert on setups scoring 60+ out of 100
-SCAN_INTERVAL_SECONDS = 300        # how often to re-scan (5 min, matches candle close)
+# structural-mode parameters (ignored in fixed mode):
+ATR_PERIOD = 14
+ATR_STOP_MULTIPLE = 0.5
+SWING_LOOKBACK = 12
+MIN_SL_PCT = 0.6               # tightest structural stop
+MAX_SL_PCT = 1.5              # widest structural stop
 
-# --- Outcome tracker settings ---
+# --- Order-book wall (now a filter/confirmation, not the entry anchor) ---
+REQUIRE_WALL = False           # if True, only alert when a real buy wall sits below price
+WALL_SCAN_DEPTH_PCT = 2.0
+WALL_MIN_MULTIPLE = 3.0
+
+# --- Cooldown / scoring / cadence ---
+COOLDOWN_SECONDS = 1800
+MIN_ALERT_SCORE = 60
+SCAN_INTERVAL_SECONDS = 300
+
+# --- Outcome tracker ---
 OUTCOME_LOG_PATH = "outcome_log.jsonl"
-OUTCOME_TIMEOUT_HOURS = 4           # force-close a filled trade if nothing resolves within this long
+OUTCOME_TIMEOUT_HOURS = 4
 
 KUCOIN_BASE = "https://api.kucoin.com"
 
-# --- In-memory state (resets on restart — fine for now, DB comes later) ---
-last_alert_time = {}     # symbol -> unix timestamp of last alert sent
-pending_outcomes = []    # list of dicts tracking alerts awaiting outcome checks
-scanner_stats = {        # live stats served by the /status Telegram command
+# --- In-memory state ---
+last_alert_time = {}
+pending_outcomes = []
+scanner_stats = {
     "start_time": time.time(),
     "last_cycle_time": None,
     "symbols_count": 0,
@@ -118,21 +132,16 @@ scanner_stats = {        # live stats served by the /status Telegram command
 # DYNAMIC SYMBOL LIST
 # ============================================================
 def get_all_kucoin_symbols(min_volume_usdt=MIN_VOLUME_USDT):
-    """
-    Pulls all active USDT spot pairs from KuCoin, filtered by 24h volume
-    so we skip illiquid/dead coins that are unscalpable anyway.
-    """
     url = f"{KUCOIN_BASE}/api/v1/market/allTickers"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     tickers = r.json().get("data", {}).get("ticker", [])
-
     symbols = []
     for t in tickers:
         symbol = t.get("symbol", "")
         if not symbol.endswith("-USDT"):
             continue
-        vol_value = float(t.get("volValue", 0) or 0)  # 24h volume in USDT
+        vol_value = float(t.get("volValue", 0) or 0)
         if vol_value >= min_volume_usdt:
             symbols.append(symbol)
     return symbols
@@ -142,7 +151,6 @@ def get_all_kucoin_symbols(min_volume_usdt=MIN_VOLUME_USDT):
 # DATA FETCHING
 # ============================================================
 def get_kucoin_klines(symbol, kline_type=KLINE_TYPE, limit=CONTEXT_CANDLES):
-    """Fetch OHLCV candles from KuCoin public API (no key needed)."""
     url = f"{KUCOIN_BASE}/api/v1/market/candles"
     params = {"symbol": symbol, "type": kline_type}
     r = requests.get(url, params=params, timeout=10)
@@ -150,7 +158,6 @@ def get_kucoin_klines(symbol, kline_type=KLINE_TYPE, limit=CONTEXT_CANDLES):
     data = r.json().get("data", [])
     if not data:
         return None
-    # KuCoin returns newest first: [time, open, close, high, low, volume, turnover]
     df = pd.DataFrame(
         data,
         columns=["time", "open", "close", "high", "low", "volume", "turnover"],
@@ -159,26 +166,12 @@ def get_kucoin_klines(symbol, kline_type=KLINE_TYPE, limit=CONTEXT_CANDLES):
         {"time": "int64", "open": "float", "close": "float",
          "high": "float", "low": "float", "volume": "float", "turnover": "float"}
     )
-    df = df.sort_values("time").reset_index(drop=True)  # oldest -> newest
+    df = df.sort_values("time").reset_index(drop=True)
     return df.tail(limit).reset_index(drop=True)
 
 
 def get_kucoin_trade_history_window(symbol, window_minutes=CVD_WINDOW_MINUTES, max_pages=CVD_MAX_PAGES):
-    """
-    Paginates KuCoin's public trade-history endpoint backward (using the
-    'before' cursor) until the trades collected cover roughly `window_minutes`,
-    or `max_pages` is hit — whichever comes first.
-
-    This replaces a fixed "last 100 trades" pull, which was inconsistent:
-    on busy pairs like BTC that's only 2-3 minutes of tape, on slower pairs
-    it could be an hour+. Now CVD is measured over a consistent time window
-    that matches the price-range lookback, on any pair.
-
-    NOTE: KuCoin's public /market/histories endpoint pagination behavior
-    should be double-checked against current KuCoin API docs if this stops
-    returning expected pages — public endpoints occasionally change cursor
-    field names.
-    """
+    """Paginate the trade tape back ~window_minutes for a consistent CVD window."""
     url = f"{KUCOIN_BASE}/api/v1/market/histories"
     all_trades = []
     before_cursor = None
@@ -196,10 +189,8 @@ def get_kucoin_trade_history_window(symbol, window_minutes=CVD_WINDOW_MINUTES, m
             break
         if not data:
             break
-
         all_trades.extend(data)
-        oldest_time_ns = int(data[-1].get("time", 0))
-        oldest_time_ms = oldest_time_ns / 1_000_000  # KuCoin trade time is in nanoseconds
+        oldest_time_ms = int(data[-1].get("time", 0)) / 1_000_000
         if oldest_time_ms <= window_start_ms:
             break
         before_cursor = data[-1].get("sequence") or data[-1].get("time")
@@ -210,7 +201,6 @@ def get_kucoin_trade_history_window(symbol, window_minutes=CVD_WINDOW_MINUTES, m
 
 
 def get_orderbook_snapshot(symbol):
-    """Fetch best bid/ask for spread + current price checks."""
     url = f"{KUCOIN_BASE}/api/v1/market/orderbook/level1"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     r.raise_for_status()
@@ -218,10 +208,6 @@ def get_orderbook_snapshot(symbol):
 
 
 def get_orderbook_depth(symbol):
-    """
-    Fetch the top 100 levels of real order book depth (public endpoint).
-    Returns {'bids': [[price, size], ...], 'asks': [[price, size], ...]}.
-    """
     url = f"{KUCOIN_BASE}/api/v1/market/orderbook/level2_100"
     r = requests.get(url, params={"symbol": symbol}, timeout=10)
     r.raise_for_status()
@@ -230,21 +216,11 @@ def get_orderbook_depth(symbol):
 
 def find_bid_wall(symbol, current_price, scan_depth_pct=WALL_SCAN_DEPTH_PCT,
                   min_multiple=WALL_MIN_MULTIPLE):
-    """
-    Scans real resting bids below current price for a genuine buy wall:
-    a level (or tight cluster) holding at least `min_multiple`x the average
-    bid size within the scan zone. Walls act as actual defended floors —
-    real money sitting there, not a line drawn on a chart.
-
-    Returns {'price': ..., 'size': ..., 'strength': ...} or None if the
-    book has no meaningful wall right now (in which case the caller falls
-    back to structure-based levels).
-    """
+    """Find a genuine buy wall below price: a level several x the average bid size."""
     try:
         book = get_orderbook_depth(symbol)
     except Exception:
         return None
-
     bids = book.get("bids") or []
     if not bids:
         return None
@@ -253,31 +229,26 @@ def find_bid_wall(symbol, current_price, scan_depth_pct=WALL_SCAN_DEPTH_PCT,
     zone = []
     for level in bids:
         try:
-            p = float(level[0])
-            s = float(level[1])
+            p = float(level[0]); s = float(level[1])
         except (ValueError, IndexError, TypeError):
             continue
         if floor_price <= p < current_price:
-            zone.append((p, p * s))  # size in quote (USDT) terms so coins compare fairly
-
+            zone.append((p, p * s))
     if len(zone) < 5:
-        return None  # too thin a book to call anything a wall
+        return None
 
     avg_value = sum(v for _, v in zone) / len(zone)
     best_price, best_value = max(zone, key=lambda x: x[1])
-
     if avg_value <= 0 or best_value < avg_value * min_multiple:
-        return None  # nothing stands out enough to be a real wall
-
+        return None
     return {
         "price": best_price,
         "value_usdt": round(best_value, 2),
-        "strength": round(best_value / avg_value, 2),  # how many times the average this wall is
+        "strength": round(best_value / avg_value, 2),
     }
 
 
 def get_spread_pct(symbol):
-    """Bid/ask spread as a percentage of bid price. None if unavailable."""
     data = get_orderbook_snapshot(symbol)
     bid = float(data.get("bestBid", 0) or 0)
     ask = float(data.get("bestAsk", 0) or 0)
@@ -287,14 +258,13 @@ def get_spread_pct(symbol):
 
 
 def get_current_price(symbol):
-    """Current traded price, used by the outcome tracker."""
     data = get_orderbook_snapshot(symbol)
     price = float(data.get("price", 0) or 0)
     return price if price > 0 else None
 
 
 # ============================================================
-# WYCKOFF DETECTION LOGIC
+# WYCKOFF DETECTION
 # ============================================================
 def compute_range(df, window=RANGE_WINDOW):
     df["range_high"] = df["high"].rolling(window=window).max()
@@ -304,31 +274,22 @@ def compute_range(df, window=RANGE_WINDOW):
 
 
 def compute_macro_context(df, window=CONTEXT_CANDLES):
-    """
-    Uses the full 48h window to define the broader trading range.
-    Tells us where current price sits in that range — accumulation
-    should be happening in the LOWER portion, not near the top
-    (near the top = more likely distribution, not accumulation).
-    """
     window_df = df.tail(window)
     macro_high = window_df["high"].max()
     macro_low = window_df["low"].min()
-
     current_price = df["close"].iloc[-1]
     if macro_high == macro_low:
         position_pct = 50.0
     else:
         position_pct = (current_price - macro_low) / (macro_high - macro_low) * 100
-
     return {
         "macro_high": macro_high,
         "macro_low": macro_low,
-        "position_pct": round(position_pct, 1),  # 0 = at 48h low, 100 = at 48h high
+        "position_pct": round(position_pct, 1),
     }
 
 
 def detect_spring(df):
-    """Spring: wick below range low, closes back inside, on relatively low volume."""
     avg_vol = df["volume"].rolling(VOL_AVG_WINDOW).mean()
     last = df.iloc[-1]
     prev_range_low = df["range_low"].iloc[-2]
@@ -341,7 +302,6 @@ def detect_spring(df):
 
 
 def detect_sos(df):
-    """Sign of Strength: close above range high, on volume expansion, strong candle."""
     avg_vol = df["volume"].rolling(VOL_AVG_WINDOW).mean()
     last = df.iloc[-1]
     prev_range_high = df["range_high"].iloc[-2]
@@ -354,7 +314,6 @@ def detect_sos(df):
 
 
 def detect_lps(df, sos_lookback=5):
-    """Last Point of Support: pullback to former resistance after a recent SOS, on light volume."""
     avg_vol = df["volume"].rolling(VOL_AVG_WINDOW).mean()
     last = df.iloc[-1]
     sos_recent = any(detect_sos(df.iloc[: i + 1]) for i in range(len(df) - sos_lookback, len(df) - 1))
@@ -366,35 +325,7 @@ def detect_lps(df, sos_lookback=5):
     return bool(sos_recent and pulled_back and light_volume)
 
 
-def detect_sideways_accumulation(df, trades, tight_range_pct=TIGHT_RANGE_PCT, lookback=ACCUM_LOOKBACK):
-    """
-    Detects a small sideways range where buying (accumulation) is quietly happening.
-    - Price has stayed inside a TIGHT range for the last `lookback` candles
-    - CVD over that same window is positive (buyers absorbing supply)
-    """
-    if len(df) < lookback + 2:
-        return False, None
-
-    recent = df.tail(lookback)
-    range_high = recent["high"].max()
-    range_low = recent["low"].min()
-    range_pct = (range_high - range_low) / range_low
-
-    is_tight = range_pct <= tight_range_pct
-
-    cvd = compute_cvd(trades) if trades else 0
-    is_accumulating = cvd > 0
-
-    return bool(is_tight and is_accumulating), {
-        "range_pct": round(range_pct * 100, 3),
-        "cvd": round(cvd, 2),
-        "range_high": range_high,
-        "range_low": range_low,
-    }
-
-
 def compute_cvd(trades):
-    """Cumulative Volume Delta from a trade tape window."""
     delta = 0.0
     for t in trades:
         size = float(t.get("size", 0))
@@ -405,105 +336,90 @@ def compute_cvd(trades):
     return delta
 
 
+def detect_sideways_accumulation(df, trades, tight_range_pct=TIGHT_RANGE_PCT, lookback=ACCUM_LOOKBACK):
+    if len(df) < lookback + 2:
+        return False, None
+    recent = df.tail(lookback)
+    range_high = recent["high"].max()
+    range_low = recent["low"].min()
+    range_pct = (range_high - range_low) / range_low
+    is_tight = range_pct <= tight_range_pct
+    cvd = compute_cvd(trades) if trades else 0
+    is_accumulating = cvd > 0
+    return bool(is_tight and is_accumulating), {
+        "range_pct": round(range_pct * 100, 3),
+        "cvd": round(cvd, 2),
+        "range_high": range_high,
+        "range_low": range_low,
+    }
+
+
 # ============================================================
-# TRADE LEVELS (entry / stop / target)
+# TRADE LEVELS  (market entry, 1:1.5 R:R)
 # ============================================================
 def compute_atr(df, period=ATR_PERIOD):
-    """Wilder's Average True Range — standard volatility measure for stop sizing."""
-    high = df["high"]
-    low = df["low"]
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr.iloc[-1]
+    high = df["high"]; low = df["low"]; prev_close = df["close"].shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
 
 
-def compute_trade_levels(df, accum_info, symbol):
+def compute_trade_levels(df, accum_info, symbol, wall):
     """
-    Anchors the entry to REAL order book liquidity instead of a price
-    calculated from a formula:
+    Market entry with a 1:1.5 risk:reward.
 
-    - Entry: scans actual resting bids below current price for a genuine
-      buy wall (a level holding several times the average bid size).
-      Entry is placed just above that wall — real money is defending
-      that price, so fills there sit on top of an actual floor.
-      If no meaningful wall exists right now, falls back to the
-      accumulation range support (structure-based).
-    - Stop: just below the wall minus an ATR buffer — if the wall breaks,
-      the reason for the trade is gone, so the exit is immediate and small.
-    - TP1 / TP2: 3% / 5% scalping floors, raised further if needed so
-      TP1 is never worse than 1:2 risk:reward and TP2 never worse than 1:3.
+    STOP_MODE == "fixed":       stop = entry - FIXED_SL_PCT%  (your 1% / 1.5% plan)
+    STOP_MODE == "structural":  stop below the lowest of (swing low, wall, range
+                                support) minus an ATR buffer, clamped to
+                                MIN_SL_PCT..MAX_SL_PCT so it respects price action
+                                without being wickable by noise or oversized.
+    Target is always RR_RATIO x the stop distance.
     """
-    last_close = float(df["close"].iloc[-1])
-    atr = compute_atr(df)
-    if pd.isna(atr) or atr <= 0:
-        atr = last_close * 0.005  # fallback before enough candles exist for a real ATR
+    entry = float(df["close"].iloc[-1])  # market entry
 
-    if accum_info:
-        range_low = accum_info["range_low"]
-    else:
-        range_low = df["range_low"].iloc[-1]
-
-    # --- Entry: anchored to a real bid wall when one exists ---
-    wall = find_bid_wall(symbol, last_close)
-    if wall:
-        entry = wall["price"] * (1 + ENTRY_ABOVE_WALL_PCT / 100)
-        anchor = "wall"
-        wall_info = wall
-        stop_base = wall["price"]
-    else:
-        entry = range_low  # structure fallback: buy at accumulation support
+    if STOP_MODE == "structural":
+        atr = compute_atr(df)
+        if pd.isna(atr) or atr <= 0:
+            atr = entry * 0.003
+        swing_low = float(df["low"].tail(SWING_LOOKBACK).min())
+        candidates = [swing_low]
+        if wall:
+            candidates.append(wall["price"])
+        if accum_info:
+            candidates.append(accum_info["range_low"])
+        structural_low = min(candidates)
+        stop_loss = structural_low - atr * ATR_STOP_MULTIPLE
+        min_stop = entry * (1 - MAX_SL_PCT / 100)
+        max_stop = entry * (1 - MIN_SL_PCT / 100)
+        stop_loss = max(min_stop, min(stop_loss, max_stop))
         anchor = "structure"
-        wall_info = None
-        stop_base = range_low
+    else:  # fixed
+        stop_loss = entry * (1 - FIXED_SL_PCT / 100)
+        anchor = "fixed"
 
-    entry = min(entry, last_close)  # never place a "buy" above where price already trades
-    is_pullback_order = entry < last_close * 0.999
-
-    # --- Stop: below the anchor with an ATR buffer ---
-    stop_loss = stop_base - atr * ATR_STOP_MULTIPLE
     risk = entry - stop_loss
     if risk <= 0:
-        risk = atr * ATR_STOP_MULTIPLE
+        risk = entry * (FIXED_SL_PCT / 100)
         stop_loss = entry - risk
 
-    # --- Targets: scalping % floors, raised by R:R floors where needed ---
-    take_profit_1 = max(
-        entry * (1 + TP1_MIN_PCT / 100),
-        entry + risk * MIN_RISK_REWARD_TP1,
-    )
-    take_profit_2 = max(
-        entry * (1 + TP2_MIN_PCT / 100),
-        entry + risk * MIN_RISK_REWARD_TP2,
-        take_profit_1 + risk,
-    )
+    take_profit = entry + risk * RR_RATIO
 
     sl_pct = round((entry - stop_loss) / entry * 100, 2)
-    tp1_pct = round((take_profit_1 - entry) / entry * 100, 2)
-    tp2_pct = round((take_profit_2 - entry) / entry * 100, 2)
-
-    rr1 = round((take_profit_1 - entry) / risk, 2) if risk > 0 else None
-    rr2 = round((take_profit_2 - entry) / risk, 2) if risk > 0 else None
+    tp_pct = round((take_profit - entry) / entry * 100, 2)
 
     return {
         "entry": round(entry, 6),
-        "anchor": anchor,                     # "wall" or "structure"
-        "wall": wall_info,                    # None if no wall found
-        "is_pullback_order": is_pullback_order,
-        "last_market_price": round(last_close, 6),
-        "atr": round(atr, 6),
+        "last_market_price": round(entry, 6),
+        "anchor": anchor,
+        "wall": wall,                 # confirmation info only, not the entry anchor
+        "is_pullback_order": False,   # market entry: always fills now
         "stop_loss": round(stop_loss, 6),
         "sl_pct": sl_pct,
-        "take_profit_1": round(take_profit_1, 6),
-        "tp1_pct": tp1_pct,
-        "rr1": rr1,
-        "take_profit_2": round(take_profit_2, 6),
-        "tp2_pct": tp2_pct,
-        "rr2": rr2,
+        "take_profit": round(take_profit, 6),
+        "tp_pct": tp_pct,
+        # kept for db/dashboard compatibility (single target duplicated):
+        "take_profit_1": round(take_profit, 6),
+        "take_profit_2": round(take_profit, 6),
+        "rr": RR_RATIO,
     }
 
 
@@ -511,31 +427,19 @@ def compute_trade_levels(df, accum_info, symbol):
 # SCORING
 # ============================================================
 def score_signal(spring, sos, lps, accum, accum_info, macro, cvd):
-    """
-    Scores a setup 0-100. Higher = stronger scalp candidate.
-    Weighted toward tight-range accumulation happening low in the 48h range,
-    since that's the core pattern being screened for.
-    """
     score = 0.0
-
     if accum and accum_info:
         score += 30
-        tightness_bonus = max(0, 20 - (accum_info["range_pct"] / (TIGHT_RANGE_PCT * 100) * 20))
-        score += tightness_bonus
-        position_bonus = max(0, 20 - (macro["position_pct"] / MACRO_POSITION_MAX_PCT * 20))
-        score += position_bonus
-
+        score += max(0, 20 - (accum_info["range_pct"] / (TIGHT_RANGE_PCT * 100) * 20))
+        score += max(0, 20 - (macro["position_pct"] / MACRO_POSITION_MAX_PCT * 20))
     if spring:
         score += 15
     if sos:
         score += 15
     if lps:
         score += 10
-
     if cvd is not None and cvd > 0:
-        cvd_bonus = min(10, cvd / 1000)  # scale based on typical CVD sizes — tune as needed
-        score += cvd_bonus
-
+        score += min(10, cvd / 1000)
     return round(min(score, 100), 1)
 
 
@@ -554,19 +458,12 @@ def send_telegram_alert(message):
 
 
 # ============================================================
-# TELEGRAM COMMANDS (/status, /positions, /results, /help)
-# Runs in a background thread so the scanner loop is never blocked.
+# TELEGRAM COMMANDS
 # ============================================================
-def _format_uptime(seconds):
-    h, rem = divmod(int(seconds), 3600)
-    m, _ = divmod(rem, 60)
-    if h > 0:
-        return f"{h}h {m}m"
-    return f"{m}m"
-
-
-SCANNER_NAME = "Inshal Crypto Scanner"
-SCANNER_VERSION = "v3.0"
+def _stop_desc():
+    if STOP_MODE == "fixed":
+        return f"{FIXED_SL_PCT}% fixed"
+    return f"price action ({MIN_SL_PCT}-{MAX_SL_PCT}%)"
 
 
 def handle_status_command():
@@ -577,74 +474,50 @@ def handle_status_command():
                 results_logged = sum(1 for line in f if line.strip())
         except Exception:
             pass
-
-    open_positions = len([p for p in pending_outcomes if p["stage"] in ("open", "tp1_hit")])
-    waiting_fills = len([p for p in pending_outcomes if p["stage"] == "pending_entry"])
-
+    open_positions = len([p for p in pending_outcomes if p["stage"] == "open"])
     return (
         f"🤖 *{SCANNER_NAME} {SCANNER_VERSION} Status*\n\n"
         f"✅ Running: True\n"
         f"🔄 Scans Completed: {scanner_stats['cycles_completed']}\n"
         f"📈 Active Positions: {open_positions}\n"
-        f"⏳ Pending Limit Orders: {waiting_fills}\n"
         f"👀 Coins in Watchlist: {scanner_stats['symbols_count']}\n"
         f"📋 Total Results Logged: {results_logged}\n"
-        f"🎯 Threshold: Score ≥{MIN_ALERT_SCORE} | HIGH confidence ≥80\n"
-        f"🧱 Wall Entry Detection: ENABLED\n"
-        f"💰 TP1: min +{TP1_MIN_PCT:.0f}% | TP2: min +{TP2_MIN_PCT:.0f}% | SL: dynamic (ATR below wall)"
+        f"🎯 Threshold: Score ≥{MIN_ALERT_SCORE} | HIGH ≥80\n"
+        f"🧱 Wall Filter: {'REQUIRED' if REQUIRE_WALL else 'confirmation only'}\n"
+        f"💰 Entry: MARKET | R:R 1:{RR_RATIO} | SL: {_stop_desc()}"
     )
 
 
 def handle_positions_command():
-    active = [p for p in pending_outcomes if p["stage"] in ("open", "tp1_hit")]
-    waiting = [p for p in pending_outcomes if p["stage"] == "pending_entry"]
-
-    if not active and not waiting:
+    active = [p for p in pending_outcomes if p["stage"] == "open"]
+    if not active:
         return "📭 No active positions right now."
-
-    lines = []
-    if active:
-        lines.append(f"📈 *Active Positions ({len(active)})*\n")
-        for p in active:
-            try:
-                price = get_current_price(p["symbol"])
-            except Exception:
-                price = None
-
-            if price:
-                move_pct = round((price - p["entry_price"]) / p["entry_price"] * 100, 2)
-                sign = "+" if move_pct >= 0 else ""
-                current_line = f"  Current: ${price:g} ({sign}{move_pct}%)\n"
-            else:
-                current_line = "  Current: (price unavailable)\n"
-
-            tp1_note = "  🎯 TP1 HIT — stop at breakeven\n" if p["stage"] == "tp1_hit" else ""
-
-            lines.append(
-                f"*{p['symbol']}*\n"
-                f"  Entry: ${p['entry_price']:g}\n"
-                f"{current_line}"
-                f"  TP1: ${p['take_profit_1']:g}\n"
-                f"  TP2: ${p['take_profit_2']:g}\n"
-                f"  SL: ${p['stop_loss']:g}\n"
-                f"{tp1_note}"
-            )
-
-    if waiting:
-        lines.append(f"⏳ *Pending Limit Orders ({len(waiting)})*\n")
-        for p in waiting:
-            lines.append(
-                f"*{p['symbol']}* — waiting for fill at ${p['entry_price']:g}\n"
-                f"  TP1: ${p['take_profit_1']:g} | TP2: ${p['take_profit_2']:g} | SL: ${p['stop_loss']:g}\n"
-            )
-
+    lines = [f"📈 *Active Positions ({len(active)})*\n"]
+    for p in active:
+        try:
+            price = get_current_price(p["symbol"])
+        except Exception:
+            price = None
+        if price:
+            move = round((price - p["entry_price"]) / p["entry_price"] * 100, 2)
+            sign = "+" if move >= 0 else ""
+            cur = f"  Current: ${price:g} ({sign}{move}%)\n"
+        else:
+            cur = "  Current: (unavailable)\n"
+        lines.append(
+            f"*{p['symbol']}*\n"
+            f"  Entry: ${p['entry_price']:g}\n"
+            f"{cur}"
+            f"  Target: ${p['target']:g} (+{p['tp_pct']}%)\n"
+            f"  SL: ${p['stop_loss']:g} (-{p['sl_pct']}%)\n"
+            f"  Peak so far: +{round(p['mfe'],2)}% | Dip: {round(p['mae'],2)}%\n"
+        )
     return "\n".join(lines)
 
 
 def handle_results_command():
     if not os.path.exists(OUTCOME_LOG_PATH):
         return "📭 No completed trades logged yet."
-
     records = []
     try:
         with open(OUTCOME_LOG_PATH) as f:
@@ -654,88 +527,72 @@ def handle_results_command():
                     records.append(json.loads(line))
     except Exception as e:
         return f"⚠️ Could not read results log: {e}"
-
     if not records:
         return "📭 No completed trades logged yet."
 
     total = len(records)
-    tp2_hits = [r for r in records if r["outcome"] == "TP2_FULL_EXIT"]
-    tp1_hits = [r for r in records if r["outcome"] == "BREAKEVEN_EXIT"]  # TP1 was reached, rest exited flat
-    stopped = [r for r in records if r["outcome"] == "STOPPED"]
-    expired = [r for r in records if r["outcome"] == "ENTRY_EXPIRED"]
-    timeouts = [r for r in records if r["outcome"] == "TIMEOUT_CLOSE"]
+    tp = [r for r in records if r["outcome"] == "TP_HIT"]
+    sl = [r for r in records if r["outcome"] == "STOPPED"]
+    to = [r for r in records if r["outcome"] == "TIMEOUT_CLOSE"]
 
     def pct(n):
         return round(n / total * 100, 1) if total else 0.0
 
-    closed = [r for r in records if r["outcome"] != "ENTRY_EXPIRED"]
-    wins = [r for r in closed if r["realized_pct"] > 0]
-    losses = [r for r in closed if r["realized_pct"] < 0]
-    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
-    avg_win = round(sum(r["realized_pct"] for r in wins) / len(wins), 2) if wins else 0.0
-    avg_loss = round(sum(r["realized_pct"] for r in losses) / len(losses), 2) if losses else 0.0
+    resolved = len(tp) + len(sl) + len(to)
+    win_rate = round(len(tp) / resolved * 100, 1) if resolved else 0.0
+    avg_win = round(sum(r["realized_pct"] for r in tp) / len(tp), 2) if tp else 0.0
+    avg_loss = round(sum(r["realized_pct"] for r in sl) / len(sl), 2) if sl else 0.0
 
-    bar = "━" * 20
+    mfes = [r.get("mfe", 0) for r in records]
+    maes = [r.get("mae", 0) for r in records]
+    avg_mfe = round(sum(mfes) / len(mfes), 2) if mfes else 0.0
+    avg_mae = round(sum(maes) / len(maes), 2) if maes else 0.0
 
-    # --- By entry type (Wall vs Structure anchored entries) ---
     anchor_stats = {}
-    for r in closed:
-        a = r.get("anchor", "unknown").capitalize()
-        stats = anchor_stats.setdefault(a, {"wins": 0, "total": 0})
-        stats["total"] += 1
-        if r["realized_pct"] > 0:
-            stats["wins"] += 1
+    for r in records:
+        a = r.get("anchor", "?").capitalize()
+        s = anchor_stats.setdefault(a, {"win": 0, "tot": 0})
+        s["tot"] += 1
+        if r["outcome"] == "TP_HIT":
+            s["win"] += 1
     anchor_lines = "\n".join(
-        f"• {a}: {s['wins']}/{s['total']} win "
-        f"({round(s['wins'] / s['total'] * 100, 0):.0f}%)"
+        f"• {a}: {s['win']}/{s['tot']} TP ({round(s['win']/s['tot']*100,0):.0f}%)"
         for a, s in sorted(anchor_stats.items())
-    ) or "• (no closed trades yet)"
+    ) or "• (none yet)"
 
-    # --- Trade log (last 10, newest first) ---
-    outcome_short = {
-        "TP2_FULL_EXIT": "TP2",
-        "BREAKEVEN_EXIT": "TP1",
-        "STOPPED": "SL",
-        "ENTRY_EXPIRED": "EXPIRED",
-        "TIMEOUT_CLOSE": "TIMEOUT",
-    }
+    short = {"TP_HIT": "TP", "STOPPED": "SL", "TIMEOUT_CLOSE": "TIMEOUT"}
     log_lines = "\n".join(
-        f"  {r['symbol']} → {outcome_short.get(r['outcome'], r['outcome'])}  "
-        f"{'+' if r['realized_pct'] >= 0 else ''}{r['realized_pct']:.2f}%  "
-        f"[{r.get('anchor', 'unknown').capitalize()}]"
+        f"  {r['symbol']} → {short.get(r['outcome'], r['outcome'])}  "
+        f"{'+' if r['realized_pct']>=0 else ''}{r['realized_pct']:.2f}%  "
+        f"(ran +{r.get('mfe',0):.1f}/{r.get('mae',0):.1f})"
         for r in reversed(records[-10:])
     )
-
-    timeout_line = f"⏱ Timeout:     {len(timeouts)}  ({pct(len(timeouts))}%)\n" if timeouts else ""
-
+    bar = "━" * 20
     return (
         f"📊 *Scanner Performance Report*\n"
-        f"🗓 All time | {total} trade(s)\n"
-        f"{bar}\n"
-        f"🏆 TP2 Hit:      {len(tp2_hits)}  ({pct(len(tp2_hits))}%)\n"
-        f"🎯 TP1 Hit:      {len(tp1_hits)}  ({pct(len(tp1_hits))}%)\n"
-        f"🛑 Stop Loss:    {len(stopped)}  ({pct(len(stopped))}%)\n"
-        f"⌛ Expired:      {len(expired)}  ({pct(len(expired))}%)\n"
-        f"{timeout_line}"
-        f"{bar}\n"
-        f"✅ Win Rate:   {win_rate}%\n"
+        f"🗓 All time | {total} trade(s)\n{bar}\n"
+        f"🏆 Target Hit:  {len(tp)}  ({pct(len(tp))}%)\n"
+        f"🛑 Stop Loss:   {len(sl)}  ({pct(len(sl))}%)\n"
+        f"⏱ Timeout:     {len(to)}  ({pct(len(to))}%)\n{bar}\n"
+        f"✅ Win Rate:   {win_rate}%  (breakeven need: 40%)\n"
         f"📈 Avg Win:    +{avg_win}%\n"
-        f"📉 Avg Loss:   {avg_loss}%\n"
-        f"{bar}\n"
-        f"*BY ENTRY TYPE:*\n"
-        f"{anchor_lines}\n"
-        f"{bar}\n"
-        f"*TRADE LOG:*\n"
-        f"{log_lines}"
+        f"📉 Avg Loss:   {avg_loss}%\n{bar}\n"
+        f"🔎 *Calibration* (how far price actually ran):\n"
+        f"   Avg peak up:  +{avg_mfe}%\n"
+        f"   Avg dip down: {avg_mae}%\n"
+        f"   → target is +{records[-1].get('tp_pct', RR_RATIO)}%; "
+        f"if avg peak ≥ target, aim is reachable\n{bar}\n"
+        f"*BY STOP TYPE:*\n{anchor_lines}\n{bar}\n"
+        f"*TRADE LOG:*\n{log_lines}"
     )
 
 
 def handle_help_command():
     return (
         "🤖 *Commands*\n\n"
-        "/status — scanner health, uptime, cycles, open position count\n"
-        "/positions — every tracked trade and pending limit order, live\n"
-        "/results — win rate and outcome summary from the trade log\n"
+        "/status — health, uptime, active positions\n"
+        "/positions — live trades with peak/dip so far\n"
+        "/results — win rate + calibration (how far price ran)\n"
         "/help — this message"
     )
 
@@ -743,40 +600,30 @@ def handle_help_command():
 COMMAND_HANDLERS = {
     "/status": handle_status_command,
     "/positions": handle_positions_command,
-    "/position": handle_positions_command,   # alias — both spellings work
+    "/position": handle_positions_command,
     "/results": handle_results_command,
-    "/result": handle_results_command,       # alias
+    "/result": handle_results_command,
     "/help": handle_help_command,
-    "/start": handle_help_command,           # Telegram convention
+    "/start": handle_help_command,
 }
 
 
 def poll_telegram_commands():
-    """
-    Long-polls Telegram's getUpdates in a background thread and answers
-    recognized commands. Only responds to messages from the configured
-    TELEGRAM_CHAT_ID — anyone else messaging the bot is ignored.
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     offset = None
-
     while True:
         try:
             params = {"timeout": 30}
             if offset is not None:
                 params["offset"] = offset
             r = requests.get(url, params=params, timeout=40)
-            updates = r.json().get("result", [])
-
-            for update in updates:
+            for update in r.json().get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message") or {}
                 chat_id = str((msg.get("chat") or {}).get("id", ""))
                 text = (msg.get("text") or "").strip()
-
                 if chat_id != str(TELEGRAM_CHAT_ID):
-                    continue  # ignore anyone who isn't you
-
+                    continue
                 command = text.split()[0].split("@")[0].lower() if text else ""
                 handler = COMMAND_HANDLERS.get(command)
                 if handler:
@@ -786,30 +633,27 @@ def poll_telegram_commands():
                         send_telegram_alert(f"⚠️ Command failed: {e}")
         except Exception as e:
             print(f"[Telegram polling error] {e}")
-            time.sleep(5)  # back off briefly, then resume listening
+            time.sleep(5)
 
 
 # ============================================================
-# OUTCOME TRACKER
+# OUTCOME TRACKER  (market fill -> TP / SL / timeout, with MFE/MAE)
 # ============================================================
 def log_signal_for_outcome_tracking(symbol, score, levels, ts):
-    # If the entry is a pullback limit order, it hasn't filled yet — start
-    # in pending_entry and only begin trade management once price actually
-    # reaches the entry. If entry is at/near market, treat it as filled now.
-    initial_stage = "pending_entry" if levels["is_pullback_order"] else "open"
     pending_outcomes.append({
         "symbol": symbol,
         "entry_price": levels["entry"],
         "stop_loss": levels["stop_loss"],
-        "take_profit_1": levels["take_profit_1"],
-        "take_profit_2": levels["take_profit_2"],
-        "anchor": levels["anchor"],   # "wall" or "structure" — used in /results breakdown
+        "target": levels["take_profit"],
+        "sl_pct": levels["sl_pct"],
+        "tp_pct": levels["tp_pct"],
+        "anchor": levels["anchor"],
         "score": score,
         "alert_time": time.time(),
         "alert_time_str": ts,
-        "stage": initial_stage,   # pending_entry -> open -> tp1_hit -> closed
-        "fill_time": None if initial_stage == "pending_entry" else time.time(),
-        "realized_pct": 0.0,      # weighted % already locked in from any partial close
+        "stage": "open",     # filled instantly at market
+        "mfe": 0.0,          # max favourable excursion (%)
+        "mae": 0.0,          # max adverse excursion (%)
     })
 
 
@@ -820,112 +664,68 @@ def _log_outcome_record(entry, outcome_label, exit_price, realized_pct):
         "anchor": entry.get("anchor", "unknown"),
         "alert_time": entry["alert_time_str"],
         "entry_price": entry["entry_price"],
-        "outcome": outcome_label,
         "exit_price": round(exit_price, 6),
+        "outcome": outcome_label,
         "realized_pct": round(realized_pct, 3),
+        "tp_pct": entry["tp_pct"],
+        "sl_pct": entry["sl_pct"],
+        "mfe": round(entry["mfe"], 3),
+        "mae": round(entry["mae"], 3),
     }
     with open(OUTCOME_LOG_PATH, "a") as f:
         f.write(json.dumps(record) + "\n")
-    print(f"[Outcome] {entry['symbol']} {outcome_label}: {round(realized_pct, 3)}%")
+    print(f"[Outcome] {entry['symbol']} {outcome_label}: {round(realized_pct,3)}% "
+          f"(peak +{record['mfe']}%, dip {record['mae']}%)")
+    if DB_ENABLED:
+        try:
+            db.save_outcome(record)
+            db.close_position(entry["symbol"], entry["entry_price"])
+        except Exception as e:
+            print(f"[DB error saving outcome] {e}")
 
 
 def check_pending_outcomes():
-    """
-    Walks each alert through the actual trade plan:
-      pending_entry -> price touches entry     => FILLED, becomes open
-      pending_entry -> ENTRY_EXPIRY_HOURS pass => ENTRY_EXPIRED, no trade
-      open          -> price hits stop_loss    => STOPPED, fully closed
-      open          -> price hits TP1          => close 50%, stop to breakeven
-      tp1_hit       -> price hits TP2          => close remaining, TP2_FULL_EXIT
-      tp1_hit       -> price returns to entry  => close remaining, BREAKEVEN_EXIT
-      (filled)      -> OUTCOME_TIMEOUT_HOURS pass with no resolution
-                       => close at current price, TIMEOUT_CLOSE
-    Every resolution is appended to outcome_log.jsonl for later review.
-    """
     if not pending_outcomes:
         return
-
     now = time.time()
     still_pending = []
-
     for entry in pending_outcomes:
-        entry_price = entry["entry_price"]
-
+        ep = entry["entry_price"]
         try:
             price = get_current_price(entry["symbol"])
         except Exception as e:
             print(f"[Error checking outcome for {entry['symbol']}] {e}")
             still_pending.append(entry)
             continue
-
         if not price:
             still_pending.append(entry)
             continue
 
+        move_pct = (price - ep) / ep * 100
+        entry["mfe"] = max(entry["mfe"], move_pct)
+        entry["mae"] = min(entry["mae"], move_pct)
+
         resolved = False
-
-        # --- Stage 0: limit order waiting to fill ---
-        if entry["stage"] == "pending_entry":
-            hours_waiting = (now - entry["alert_time"]) / 3600
-            if price <= entry_price:
-                entry["stage"] = "open"
-                entry["fill_time"] = now
-                print(f"[Outcome] {entry['symbol']} entry FILLED at {entry_price} "
-                      f"(price touched the wall zone)")
-            elif hours_waiting >= ENTRY_EXPIRY_HOURS:
-                _log_outcome_record(entry, "ENTRY_EXPIRED", price, 0.0)
-                resolved = True
-            if not resolved:
-                still_pending.append(entry)
-            continue
-
-        elapsed_hours = (now - (entry["fill_time"] or entry["alert_time"])) / 3600
-
-        if entry["stage"] == "open":
-            if price <= entry["stop_loss"]:
-                pct = (price - entry_price) / entry_price * 100
-                _log_outcome_record(entry, "STOPPED", price, pct)
-                resolved = True
-            elif price >= entry["take_profit_1"]:
-                tp1_pct = (entry["take_profit_1"] - entry_price) / entry_price * 100
-                entry["realized_pct"] = tp1_pct * (PARTIAL_CLOSE_PCT / 100)
-                entry["stage"] = "tp1_hit"
-                print(f"[Outcome] {entry['symbol']} TP1 hit — {PARTIAL_CLOSE_PCT}% closed at "
-                      f"+{round(tp1_pct, 3)}%, stop moved to breakeven for the remainder")
-
-        elif entry["stage"] == "tp1_hit":
-            if price >= entry["take_profit_2"]:
-                tp2_pct = (entry["take_profit_2"] - entry_price) / entry_price * 100
-                total_pct = entry["realized_pct"] + tp2_pct * (PARTIAL_CLOSE_PCT / 100)
-                _log_outcome_record(entry, "TP2_FULL_EXIT", price, total_pct)
-                resolved = True
-            elif price <= entry_price:
-                total_pct = entry["realized_pct"]  # remaining 50% exits flat at breakeven
-                _log_outcome_record(entry, "BREAKEVEN_EXIT", price, total_pct)
-                resolved = True
-
-        if not resolved and elapsed_hours >= OUTCOME_TIMEOUT_HOURS:
-            current_pct = (price - entry_price) / entry_price * 100
-            if entry["stage"] == "tp1_hit":
-                total_pct = entry["realized_pct"] + current_pct * (PARTIAL_CLOSE_PCT / 100)
-            else:
-                total_pct = current_pct
-            _log_outcome_record(entry, "TIMEOUT_CLOSE", price, total_pct)
+        if price >= entry["target"]:
+            _log_outcome_record(entry, "TP_HIT", price, (entry["target"] - ep) / ep * 100)
+            resolved = True
+        elif price <= entry["stop_loss"]:
+            _log_outcome_record(entry, "STOPPED", price, (entry["stop_loss"] - ep) / ep * 100)
+            resolved = True
+        elif (now - entry["alert_time"]) / 3600 >= OUTCOME_TIMEOUT_HOURS:
+            _log_outcome_record(entry, "TIMEOUT_CLOSE", price, move_pct)
             resolved = True
 
         if not resolved:
             still_pending.append(entry)
-
     pending_outcomes[:] = still_pending
 
 
 # ============================================================
-# MAIN SCAN LOGIC
+# MAIN SCAN
 # ============================================================
 def scan_symbol(symbol):
-    # --- Cooldown check first: cheapest possible early exit ---
-    last_time = last_alert_time.get(symbol, 0)
-    if time.time() - last_time < COOLDOWN_SECONDS:
+    if time.time() - last_alert_time.get(symbol, 0) < COOLDOWN_SECONDS:
         return
 
     df = get_kucoin_klines(symbol, limit=CONTEXT_CANDLES)
@@ -941,26 +741,28 @@ def scan_symbol(symbol):
 
     trades = get_kucoin_trade_history_window(symbol)
     accum, accum_info = detect_sideways_accumulation(df, trades)
-
-    in_accumulation_zone = macro["position_pct"] <= MACRO_POSITION_MAX_PCT
-    accum = accum and in_accumulation_zone
+    accum = accum and macro["position_pct"] <= MACRO_POSITION_MAX_PCT
 
     if not (spring or sos or lps or accum):
-        return  # nothing interesting, skip silently
+        return
 
     cvd = compute_cvd(trades) if trades else None
     score = score_signal(spring, sos, lps, accum, accum_info, macro, cvd)
-
     if score < MIN_ALERT_SCORE:
-        return  # setup exists but too weak — skip
-
-    # --- Spread/liquidity check: skip if too costly to actually scalp ---
-    spread_pct = get_spread_pct(symbol)
-    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
-        print(f"[Skip] {symbol} score {score} but spread {spread_pct}% > {MAX_SPREAD_PCT}% max")
         return
 
-    levels = compute_trade_levels(df, accum_info, symbol)
+    spread_pct = get_spread_pct(symbol)
+    if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+        print(f"[Skip] {symbol} score {score} but spread {spread_pct}% > {MAX_SPREAD_PCT}%")
+        return
+
+    last_price = float(df["close"].iloc[-1])
+    wall = find_bid_wall(symbol, last_price)
+    if REQUIRE_WALL and not wall:
+        print(f"[Skip] {symbol} score {score} but no buy wall (REQUIRE_WALL on)")
+        return
+
+    levels = compute_trade_levels(df, accum_info, symbol, wall)
 
     confirmations = []
     if cvd is not None and cvd > 0:
@@ -968,138 +770,121 @@ def scan_symbol(symbol):
     if accum and accum_info:
         confirmations.append(f"tight range {accum_info['range_pct']}%")
         confirmations.append(f"48h position {macro['position_pct']}%")
+    if wall:
+        confirmations.append(f"buy wall {wall['strength']}x @ {wall['price']}")
     if spread_pct is not None:
         confirmations.append(f"spread {spread_pct}%")
 
     confidence = "HIGH" if score >= 80 else "MEDIUM"
 
     signal_type = []
-    if spring:
-        signal_type.append("SPRING")
-    if sos:
-        signal_type.append("SOS")
-    if lps:
-        signal_type.append("LPS")
-    if accum:
-        signal_type.append("ACCUM")
+    if spring: signal_type.append("SPRING")
+    if sos: signal_type.append("SOS")
+    if lps: signal_type.append("LPS")
+    if accum: signal_type.append("ACCUM")
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    if levels["anchor"] == "wall":
-        wall = levels["wall"]
-        entry_line = (
-            f"Entry: {levels['entry']} — LIMIT order anchored just above a real "
-            f"buy wall at {wall['price']} (${wall['value_usdt']:,.0f} resting, "
-            f"{wall['strength']}x average bid size)\n"
-        )
-    else:
-        entry_line = (
-            f"Entry: {levels['entry']} — LIMIT order at accumulation support "
-            f"(no dominant order-book wall right now)\n"
-        )
-
-    fill_note = (
-        "Order type: pullback limit — wait for price to come DOWN to entry, do not chase\n"
-        if levels["is_pullback_order"]
-        else "Order type: at/near market — price is already at the entry zone\n"
-    )
-
     message = (
         f"*Wyckoff Signal — {symbol}*\n"
         f"Score: {score}/100\n"
         f"Type: {', '.join(signal_type)}\n"
         f"Confidence: {confidence}\n\n"
-        f"{entry_line}"
-        f"{fill_note}"
-        f"Current market price: {levels['last_market_price']}\n"
+        f"Entry: {levels['entry']} — MARKET (enter now)\n"
         f"Stop Loss: {levels['stop_loss']} (-{levels['sl_pct']}%)\n"
-        f"TP1: {levels['take_profit_1']} (+{levels['tp1_pct']}%, R:R 1:{levels['rr1']})\n"
-        f"TP2: {levels['take_profit_2']} (+{levels['tp2_pct']}%, R:R 1:{levels['rr2']})\n\n"
-        f"*Plan:* at TP1 close {PARTIAL_CLOSE_PCT}% and move stop to breakeven "
-        f"(entry). If price falls back to entry after that, exit the rest at "
-        f"breakeven. If TP2 hits, close the remaining {100 - PARTIAL_CLOSE_PCT}% fully. "
-        f"If entry doesn't fill within {ENTRY_EXPIRY_HOURS}h, cancel the order.\n\n"
-        f"48h Range: {macro['macro_low']} - {macro['macro_high']} (currently at {macro['position_pct']}%)\n"
-        f"Confirmations: {', '.join(confirmations) if confirmations else 'none (price/volume only)'}\n"
+        f"Target: {levels['take_profit']} (+{levels['tp_pct']}%, R:R 1:{RR_RATIO})\n\n"
+        f"*Plan:* single target, full exit at +{levels['tp_pct']}%. "
+        f"Hard stop at -{levels['sl_pct']}%. No averaging down.\n\n"
+        f"48h Range: {macro['macro_low']} - {macro['macro_high']} "
+        f"(currently at {macro['position_pct']}%)\n"
+        f"Confirmations: {', '.join(confirmations) if confirmations else 'price/volume only'}\n"
         f"Time: {ts}"
     )
     print(message)
     send_telegram_alert(message)
     scanner_stats["alerts_sent"] += 1
-
     last_alert_time[symbol] = time.time()
     log_signal_for_outcome_tracking(symbol, score, levels, ts)
+
+    if DB_ENABLED:
+        try:
+            db.save_signal(symbol, score, signal_type, confidence, levels, macro, confirmations)
+            db.open_position(symbol, levels, score, "open")
+        except Exception as e:
+            print(f"[DB error saving signal] {e}")
 
 
 def build_startup_message(symbol_count):
     return (
-        "🟢 *Wyckoff Scalping Scanner — STARTED*\n\n"
-        "*Strategy:* Wyckoff Accumulation Detection (scalping mode)\n"
-        "*Signals tracked:* Spring, Sign of Strength (SOS), Last Point of Support (LPS), "
-        "Sideways Accumulation (ACCUM)\n"
-        "*Confirmation:* CVD (windowed to match lookback) + spread/liquidity filter\n"
-        "*Data source:* KuCoin (OHLCV + trade history + order book)\n\n"
-        f"*Watchlist:* dynamic — all KuCoin USDT pairs with 24h volume ≥ ${MIN_VOLUME_USDT:,.0f} "
-        f"({symbol_count} pairs currently)\n"
-        f"*Timeframe:* {KLINE_TYPE} candles, {CONTEXT_HOURS}h of context\n"
-        f"*Scan interval:* every {SCAN_INTERVAL_SECONDS // 60} min\n"
-        f"*Min alert score:* {MIN_ALERT_SCORE}/100\n"
-        f"*Cooldown:* {COOLDOWN_SECONDS // 60} min per symbol\n"
-        f"*Max spread:* {MAX_SPREAD_PCT}%\n\n"
-        f"Entries are anchored to REAL order-book buy walls (live resting bids), "
-        f"falling back to accumulation support when no wall exists — always a limit "
-        f"order, never a market chase. Each alert includes stop and two targets "
-        f"with % distances (TP1 min {TP1_MIN_PCT}%, TP2 min {TP2_MIN_PCT}%). "
-        f"Plan: TP1 closes {PARTIAL_CLOSE_PCT}% and moves stop to breakeven, "
-        f"TP2 closes the rest. Fills, expiries, and outcomes are tracked "
-        f"automatically and logged to {OUTCOME_LOG_PATH} for review.\n\n"
+        f"🟢 *{SCANNER_NAME} {SCANNER_VERSION} — STARTED*\n\n"
+        "*Strategy:* Wyckoff accumulation, scalping mode\n"
+        "*Signals:* Spring, SOS, LPS, Sideways Accumulation (ACCUM)\n"
+        f"*Watchlist:* dynamic — KuCoin USDT pairs, 24h vol ≥ ${MIN_VOLUME_USDT:,.0f} "
+        f"({symbol_count} pairs)\n"
+        f"*Timeframe:* {KLINE_TYPE}, {CONTEXT_HOURS}h context\n"
+        f"*Scan interval:* {SCAN_INTERVAL_SECONDS // 60} min | cooldown {COOLDOWN_SECONDS//60} min\n"
+        f"*Min score:* {MIN_ALERT_SCORE}/100\n\n"
+        f"*Entry:* MARKET price (fills every signal)\n"
+        f"*Risk:Reward:* 1:{RR_RATIO} | Stop: {_stop_desc()}\n"
+        f"Each trade records peak/dip (MFE/MAE) so you can see if the "
+        f"target is well-calibrated. Outcomes logged to {OUTCOME_LOG_PATH}.\n\n"
         f"*Commands:* /status /positions /results /help\n\n"
-        "_Note: this flags statistical setups, not guaranteed outcomes — always your own judgment on entries._"
+        "_Statistical setups, not guaranteed outcomes — your own judgment on entries._"
     )
 
 
 def run_scanner():
     print("Starting Wyckoff scalping scanner... (Ctrl+C to stop)")
 
-    # Start the Telegram command listener in the background
-    command_thread = threading.Thread(target=poll_telegram_commands, daemon=True)
-    command_thread.start()
-    print("[Info] Telegram command listener started (/status, /positions, /results, /help)")
+    if DB_ENABLED:
+        try:
+            db.init_db()
+            print("[Info] Database connected — signals saved for dashboard")
+        except Exception as e:
+            print(f"[DB init error] {e}")
+    else:
+        print("[Info] No DATABASE_URL — running Telegram-only")
+
+    threading.Thread(target=poll_telegram_commands, daemon=True).start()
+    print("[Info] Telegram command listener started")
 
     symbols_cache = []
-    last_symbol_refresh = 0
-
+    last_refresh = 0
     try:
         symbols_cache = get_all_kucoin_symbols()
-        last_symbol_refresh = time.time()
+        last_refresh = time.time()
         scanner_stats["symbols_count"] = len(symbols_cache)
-        print(f"[Info] Loaded {len(symbols_cache)} symbols to scan")
+        print(f"[Info] Loaded {len(symbols_cache)} symbols")
     except Exception as e:
-        print(f"[Error loading initial symbol list] {e}")
+        print(f"[Error loading symbols] {e}")
 
     send_telegram_alert(build_startup_message(len(symbols_cache)))
 
     while True:
         now = time.time()
-        if now - last_symbol_refresh > SYMBOL_REFRESH_SECONDS or not symbols_cache:
+        if now - last_refresh > SYMBOL_REFRESH_SECONDS or not symbols_cache:
             try:
                 symbols_cache = get_all_kucoin_symbols()
-                last_symbol_refresh = now
+                last_refresh = now
                 scanner_stats["symbols_count"] = len(symbols_cache)
-                print(f"[Info] Refreshed symbol list — {len(symbols_cache)} pairs to scan")
+                print(f"[Info] Refreshed — {len(symbols_cache)} pairs")
             except Exception as e:
-                print(f"[Error refreshing symbol list] {e}")
+                print(f"[Error refreshing symbols] {e}")
 
         for symbol in symbols_cache:
             try:
                 scan_symbol(symbol)
             except Exception as e:
                 print(f"[Error scanning {symbol}] {e}")
-            time.sleep(0.3)  # be polite to the API between symbols
+            time.sleep(0.3)
 
         check_pending_outcomes()
         scanner_stats["last_cycle_time"] = time.time()
         scanner_stats["cycles_completed"] += 1
+        if DB_ENABLED:
+            try:
+                db.update_heartbeat(scanner_stats)
+            except Exception as e:
+                print(f"[DB heartbeat error] {e}")
         time.sleep(SCAN_INTERVAL_SECONDS)
 
 
